@@ -117,6 +117,7 @@ bash 3.2 or newer (the stock macOS bash works) and git. Tested on Linux and macO
 shellcheck bin/dot test/dot.bats
 bats test/
 DOT_BASH=/bin/bash bats test/   # test against another bash
+scripts/ci-local                # run the checks and post them as commit statuses
 ```
 
 ## License

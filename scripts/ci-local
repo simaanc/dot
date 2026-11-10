@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Run the CI checks on this machine and post the results to GitHub as commit
+# statuses on HEAD (the ✓/✗ next to a commit). Useful when Actions can't run.
+#
+#   scripts/ci-local            run and post
+#   scripts/ci-local --no-post  just run
+#
+# Posting needs `gh` signed in with push access to the repo.
+set -uo pipefail
+cd "$(dirname "$0")/.." || exit 1
+
+post=1
+[[ ${1:-} == --no-post ]] && post=0
+
+if ((post)); then
+  # the statuses must describe exactly the code that was tested
+  [[ -z $(git status --porcelain) ]] || { echo "ci-local: commit or stash your changes first" >&2; exit 1; }
+  git fetch -q origin
+  [[ $(git rev-parse HEAD) == $(git rev-parse '@{u}' 2>/dev/null) ]] ||
+    { echo "ci-local: push HEAD first so the results attach to a commit GitHub has" >&2; exit 1; }
+  repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+  sha=$(git rev-parse HEAD)
+fi
+
+os=$(uname -s | tr '[:upper:]' '[:lower:]')
+bash_v=$(bash -c 'echo "${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"')
+log_dir=$(mktemp -d)
+failed=0
+
+status() { # context state description
+  ((post)) || return 0
+  gh api -X POST "repos/$repo/statuses/$sha" \
+    -f state="$2" -f context="local / $1" -f description="${3:0:140}" >/dev/null
+}
+
+check() { # name command...
+  local name=$1 log rc start secs
+  shift
+  log="$log_dir/${name//[^a-z0-9]/_}.log"
+  status "$name" pending "running on $(uname -n)"
+  start=$(date +%s)
+  "$@" >"$log" 2>&1
+  rc=$?
+  secs=$(($(date +%s) - start))
+  if ((rc == 0)); then
+    printf '✓ %s (%ss)\n' "$name" "$secs"
+    status "$name" success "passed in ${secs}s on $(uname -n)"
+  else
+    failed=1
+    printf '✗ %s (%ss)\n' "$name" "$secs"
+    sed 's/^/    /' "$log" | tail -30
+    status "$name" failure "$(grep -m1 -E 'not ok|error|SC[0-9]+' "$log" || echo "failed, exit $rc")"
+  fi
+}
+
+check "shellcheck" shellcheck bin/dot test/dot.bats scripts/ci-local
+check "bats ($os, bash $bash_v)" bats test/
+
+rm -rf "$log_dir"
+((post)) && echo "posted to https://github.com/$repo/commit/$sha"
+exit "$failed"
