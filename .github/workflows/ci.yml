@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck --version
+      - run: shellcheck bin/dot test/dot.bats
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bash: bash
+          - os: macos-latest
+            bash: bash          # Homebrew bash 5
+          - os: macos-latest
+            bash: /bin/bash     # the stock bash 3.2 every Mac ships
+    runs-on: ${{ matrix.os }}
+    name: test (${{ matrix.os }}, ${{ matrix.bash }})
+    steps:
+      - uses: actions/checkout@v4
+      - name: install bats
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then brew install bats-core
+          else sudo apt-get update -qq && sudo apt-get install -y -qq bats; fi
+      - name: bash version
+        run: ${{ matrix.bash }} --version | head -1
+      - name: bats
+        run: bats test/
+        env:
+          DOT_BASH: ${{ matrix.bash }}
