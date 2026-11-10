@@ -1,0 +1,404 @@
+#!/usr/bin/env bash
+# dot: dotfiles in a git repo, symlinked into $HOME, kept in sync.
+# https://github.com/simaanc/dot
+# Copyright (C) 2026 Christopher Simaan
+# SPDX-License-Identifier: GPL-3.0-or-later
+set -euo pipefail
+
+DOT_VERSION=0.1.0
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/dot/dir"
+
+usage() {
+  cat <<'EOF'
+dot: dotfiles in a git repo, symlinked into $HOME, kept in sync
+
+  dot init [dir] [remote]   create or register a dotfiles repo (default ~/dotfiles)
+  dot clone <url> [dir]     new machine: clone, link everything, register
+  dot add <path>...         move files into the repo, leave symlinks behind
+  dot rm <path>...          stop tracking, put the real file back
+  dot sync                  adopt overwritten files, commit, pull --rebase, push
+  dot check                 one-line notice for your shell; never waits on the network
+  dot link                  create every symlink; existing files kept as *.dot-bak
+  dot status                link problems and uncommitted changes
+  dot setup [options]       shell hook and a sync at login
+      --shell zsh|bash|fish   pick the shell (default: from $SHELL)
+      --no-shell              skip the shell hook
+      --no-boot               skip the login sync (systemd / launchd)
+  dot git <args>            run git inside the dotfiles repo
+  dot dir                   print the dotfiles repo path
+
+The repo is found via $DOT_DIR, then ~/.config/dot/dir, then ~/dotfiles.
+Tracked files live under <repo>/home/, mirroring $HOME.
+EOF
+}
+
+die() { printf 'dot: %s\n' "$*" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
+
+# --- paths --------------------------------------------------------------------
+
+# Absolute, normalised path without resolving symlinks (portable `realpath -s`).
+abspath() {
+  local p=$1 part out='' parts
+  [[ $p == /* ]] || p="$PWD/$p"
+  IFS=/ read -r -a parts <<<"$p"
+  for part in ${parts[@]+"${parts[@]}"}; do
+    case $part in
+      '' | .) ;;
+      ..) out=${out%/*} ;;
+      *) out="$out/$part" ;;
+    esac
+  done
+  printf '%s\n' "${out:-/}"
+}
+
+# Follow a chain of symlinks to the final path (portable `readlink -f` for files).
+resolve() {
+  local p=$1 t
+  while [[ -L $p ]]; do
+    t=$(readlink "$p")
+    [[ $t == /* ]] || t="$(dirname "$p")/$t"
+    p=$t
+  done
+  printf '%s\n' "$(cd "$(dirname "$p")" && pwd -P)/$(basename "$p")"
+}
+
+# Path relative to $HOME, or fail. Accepts the logical or the physical $HOME.
+rel() {
+  local p home_p
+  p=$(abspath "$1")
+  home_p=$(cd "$HOME" && pwd -P)
+  if [[ $p == "$HOME"/* ]]; then printf '%s\n' "${p#"$HOME"/}"
+  elif [[ $p == "$home_p"/* ]]; then printf '%s\n' "${p#"$home_p"/}"
+  else return 1
+  fi
+}
+
+# --- repo -----------------------------------------------------------------------
+
+dot_dir() {
+  local d=${DOT_DIR:-}
+  if [[ -z $d && -r $CONF ]]; then IFS= read -r d <"$CONF" || true; fi
+  printf '%s\n' "${d:-$HOME/dotfiles}"
+}
+
+REPO='' H=''
+need_repo() {
+  local d; d=$(dot_dir)
+  [[ -d $d/.git ]] || die "no dotfiles repo at $d (run: dot init, or dot clone <url>)"
+  REPO=$(cd "$d" && pwd -P)
+  H="$REPO/home"
+}
+
+g() { git -C "$REPO" "$@"; }
+
+register() {
+  mkdir -p "$(dirname "$CONF")"
+  printf '%s\n' "$1" >"$CONF"
+}
+
+# --- links ------------------------------------------------------------------------
+
+linked() { [[ -L $1 && $(readlink "$1") == "$2" ]]; }
+
+# Every tracked file, NUL-separated, as paths relative to $H.
+tracked() {
+  [[ -d $H ]] || return 0
+  (cd "$H" && find . -type f ! -name '.DS_Store' -print0) | while IFS= read -r -d '' f; do
+    printf '%s\0' "${f#./}"
+  done
+}
+
+add_one() {
+  local r src dst
+  r=$(rel "$1") || { say "skip (outside \$HOME): $1" >&2; return 0; }
+  src="$HOME/$r" dst="$H/$r"
+  linked "$src" "$dst" && return 0
+  case "$(abspath "$src")/" in "$REPO"/*) say "skip (inside the repo): $r" >&2; return 0 ;; esac
+  if [[ -L $src || ! -f $src ]]; then say "skip (not a regular file): $r" >&2; return 0; fi
+  mkdir -p "$(dirname "$dst")"
+  mv "$src" "$dst"
+  ln -s "$dst" "$src"
+  say "added   $r"
+}
+
+cmd_add() {
+  (($#)) || die "usage: dot add <path>..."
+  need_repo
+  local a f
+  for a in "$@"; do
+    if [[ -d $a && ! -L $a ]]; then
+      while IFS= read -r -d '' f; do add_one "$f"; done \
+        < <(find "$a" -type f ! -name '*.dot-bak' ! -name '.DS_Store' -print0)
+    else
+      add_one "$a"
+    fi
+  done
+}
+
+cmd_rm() {
+  (($#)) || die "usage: dot rm <path>..."
+  need_repo
+  local a r src dst
+  for a in "$@"; do
+    r=$(rel "$a") || { say "skip (outside \$HOME): $a" >&2; continue; }
+    src="$HOME/$r" dst="$H/$r"
+    [[ -f $dst ]] || { say "not tracked: $r" >&2; continue; }
+    # keep a real file an app already wrote there; otherwise restore the repo copy
+    if [[ -L $src || ! -e $src ]]; then rm -f "$src"; cp -p "$dst" "$src"; fi
+    g rm -q --cached -- "home/$r" 2>/dev/null || true
+    rm -f "$dst"
+    say "removed $r (real file restored)"
+  done
+}
+
+# Make every tracked file a symlink in $HOME.
+#   adopt: a real file in the way means an app rewrote it; copy it into the repo.
+#   link:  the repo wins; whatever is in the way is kept as *.dot-bak.
+walk() {
+  local mode=$1 r src tgt
+  while IFS= read -r -d '' r; do
+    src="$H/$r" tgt="$HOME/$r"
+    linked "$tgt" "$src" && continue
+    if [[ -d $tgt && ! -L $tgt ]]; then
+      say "skip    $r (a directory is in the way)" >&2
+      continue
+    fi
+    mkdir -p "$(dirname "$tgt")"
+    if [[ -L $tgt ]]; then
+      if [[ $mode == adopt ]]; then
+        say "skip    $r (links somewhere else; dot link replaces it)" >&2
+        continue
+      fi
+      mv "$tgt" "$tgt.dot-bak"; say "backup  $r -> $r.dot-bak"
+    elif [[ -e $tgt ]]; then
+      if cmp -s "$tgt" "$src"; then rm -f "$tgt"
+      elif [[ $mode == adopt ]]; then cp -p "$tgt" "$src"; rm -f "$tgt"; say "adopted $r (an app replaced the link)"
+      else mv "$tgt" "$tgt.dot-bak"; say "backup  $r -> $r.dot-bak"
+      fi
+    fi
+    ln -s "$src" "$tgt"
+    if [[ $mode == link ]]; then say "linked  $r"; fi
+  done < <(tracked)
+}
+
+# --- sync -----------------------------------------------------------------------------
+
+has_upstream() { g rev-parse -q --verify '@{u}' >/dev/null 2>&1; }
+
+cmd_sync() {
+  need_repo
+  walk adopt
+  g add -A
+  if ! g diff --cached --quiet; then
+    local n files more=''
+    n=$(g diff --cached --name-only | wc -l | tr -d ' ')
+    files=$(g diff --cached --name-only | head -5 | sed 's#.*/##' | paste -sd, -)
+    ((n <= 5)) || more=" (+$((n - 5)) more)"
+    g commit -q -m "sync $(uname -n): $files$more"
+  fi
+  if has_upstream; then
+    # take other machines' commits first; on a conflict stop and leave it to a human
+    if ! g pull -q --rebase; then
+      g rebase --abort >/dev/null 2>&1 || true
+      die "conflict with the remote; your files are untouched. Resolve with: dot git pull --rebase"
+    fi
+    walk link | grep -v '^linked' || true   # link files another machine added
+    [[ -z $(g log --oneline '@{u}..') ]] || g push -q
+  elif g remote get-url origin >/dev/null 2>&1; then
+    g push -q -u origin "$(g symbolic-ref --short HEAD)"
+  fi
+}
+
+# Shell-startup notice: answers from the last fetch instantly, and refreshes it in
+# the background at most every 10 minutes. Silent when there is nothing to say.
+cmd_check() {
+  local d; d=$(dot_dir)
+  [[ -d $d/.git ]] || return 0
+  REPO=$d
+  local fh="$REPO/.git/FETCH_HEAD"
+  if [[ ! -e $fh || -z $(find "$fh" -mmin -10 2>/dev/null) ]] && g remote get-url origin >/dev/null 2>&1; then
+    (GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=5' \
+      git -C "$REPO" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=10 fetch -q >/dev/null 2>&1 &)
+  fi
+  has_upstream || return 0
+  local behind ahead dirty
+  behind=$(g rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)
+  ahead=$(g rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
+  dirty=$(g status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  if ((behind)); then say "dot: $behind new commit(s) on the remote, run: dot sync"; fi
+  if ((ahead + dirty)); then say "dot: local dotfile changes not pushed, run: dot sync"; fi
+  return 0
+}
+
+cmd_status() {
+  need_repo
+  local r src tgt bad=0 n=0
+  while IFS= read -r -d '' r; do
+    n=$((n + 1))
+    src="$H/$r" tgt="$HOME/$r"
+    linked "$tgt" "$src" && continue
+    bad=1
+    if [[ -L $tgt ]]; then say "wrong link  $r"
+    elif [[ -e $tgt ]]; then say "replaced    $r (dot sync adopts it)"
+    else say "missing     $r (dot link creates it)"
+    fi
+  done < <(tracked)
+  ((bad)) || say "all links ok ($n files)"
+  g status --short
+}
+
+# --- setup ------------------------------------------------------------------------------
+
+cmd_init() {
+  local d=${1:-$(dot_dir)} remote=${2:-}
+  d=$(abspath "$d")
+  if [[ ! -d $d/.git ]]; then
+    mkdir -p "$d/home"
+    git -C "$d" init -q
+    git -C "$d" symbolic-ref HEAD refs/heads/main
+    say "created $d"
+  fi
+  if [[ -n $remote ]]; then
+    git -C "$d" remote add origin "$remote" 2>/dev/null || git -C "$d" remote set-url origin "$remote"
+  fi
+  register "$d"
+  say "using   $d"
+}
+
+cmd_clone() {
+  local url=${1:-} d=${2:-$HOME/dotfiles}
+  [[ -n $url ]] || die "usage: dot clone <url> [dir]"
+  d=$(abspath "$d")
+  [[ -e $d ]] && die "$d already exists"
+  git clone -q "$url" "$d"
+  register "$d"
+  REPO=$(cd "$d" && pwd -P) H="$REPO/home"
+  walk link
+  say "using   $d (next: dot setup)"
+}
+
+shell_hook() {
+  local sh=$1 rc line='command -v dot >/dev/null 2>&1 && dot check  # dot:check'
+  case $sh in
+    zsh) rc="$HOME/.zshrc" ;;
+    bash) rc="$HOME/.bashrc" ;;
+    fish)
+      rc="${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/dot.fish"
+      mkdir -p "$(dirname "$rc")"
+      printf '%s\n' 'status is-interactive; and command -q dot; and dot check' >"$rc"
+      say "hook    $rc"
+      return
+      ;;
+    *) say "skip    shell hook: unknown shell '$sh' (use --shell zsh|bash|fish)" >&2; return ;;
+  esac
+  if grep -qF '# dot:check' "$rc" 2>/dev/null; then say "hook    $rc (already there)"; return; fi
+  printf '\n%s\n' "$line" >>"$rc"
+  say "hook    $rc"
+}
+
+boot_sync() {
+  local self=$1
+  if [[ $(uname -s) == Darwin ]]; then
+    local plist="$HOME/Library/LaunchAgents/io.github.simaanc.dot.plist"
+    mkdir -p "$(dirname "$plist")"
+    cat >"$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>io.github.simaanc.dot</string>
+  <key>ProgramArguments</key><array><string>$self</string><string>sync</string></array>
+  <key>EnvironmentVariables</key><dict><key>DOT_DIR</key><string>$REPO</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/dot-sync.log</string>
+</dict>
+</plist>
+EOF
+    launchctl bootout "gui/$(id -u)" "$plist" >/dev/null 2>&1 || true
+    launchctl bootstrap "gui/$(id -u)" "$plist" >/dev/null 2>&1 || true
+    say "login   $plist (syncs at login)"
+  elif command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+    local u="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    mkdir -p "$u"
+    cat >"$u/dot-sync.service" <<EOF
+[Unit]
+Description=dot: sync dotfiles ($REPO)
+StartLimitIntervalSec=30min
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+Environment=DOT_DIR=$REPO
+Environment="GIT_SSH_COMMAND=ssh -o BatchMode=yes -o ConnectTimeout=10"
+ExecStart=$self sync
+# the network may not be up yet right after boot: retry a few times
+Restart=on-failure
+RestartSec=2min
+EOF
+    cat >"$u/dot-sync.timer" <<'EOF'
+[Unit]
+Description=dot: sync dotfiles once after boot
+
+[Timer]
+OnBootSec=2min
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl --user daemon-reload
+    systemctl --user enable -q dot-sync.timer
+    systemctl --user restart dot-sync.timer
+    say "boot    $u/dot-sync.timer (syncs 2 min after boot)"
+  else
+    say "skip    login sync: no systemd user session or launchd found" >&2
+  fi
+}
+
+cmd_setup() {
+  local shell_on=1 boot_on=1 sh self found
+  sh=$(basename "${SHELL:-}")
+  while (($#)); do
+    case $1 in
+      --shell) sh=${2:-}; shift ;;
+      --no-shell) shell_on=0 ;;
+      --no-boot) boot_on=0 ;;
+      *) die "unknown option: $1" ;;
+    esac
+    shift
+  done
+  need_repo
+  self=$(resolve "${BASH_SOURCE[0]}")
+  # make sure `dot` on PATH is this script
+  found=$(command -v dot 2>/dev/null || true)
+  if [[ -z $found || $(resolve "$found") != "$self" ]]; then
+    mkdir -p "$HOME/.local/bin"
+    ln -sfn "$self" "$HOME/.local/bin/dot"
+    say "command $HOME/.local/bin/dot"
+    case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) say "note    add ~/.local/bin to your PATH" >&2 ;; esac
+  fi
+  ((shell_on)) && shell_hook "$sh"
+  ((boot_on)) && boot_sync "$self"
+  return 0
+}
+
+# --- main --------------------------------------------------------------------------------
+
+cmd=${1:-status}
+(($#)) && shift
+case $cmd in
+  init) cmd_init "$@" ;;
+  clone) cmd_clone "$@" ;;
+  add) cmd_add "$@" ;;
+  rm) cmd_rm "$@" ;;
+  sync) cmd_sync ;;
+  check) cmd_check ;;
+  link) need_repo; walk link ;;
+  status) cmd_status ;;
+  setup) cmd_setup "$@" ;;
+  git) need_repo; g "$@" ;;
+  dir) dot_dir ;;
+  -h | --help | help) usage ;;
+  -V | --version | version) say "dot $DOT_VERSION" ;;
+  *) usage >&2; exit 2 ;;
+esac
